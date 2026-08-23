@@ -20,6 +20,8 @@
  *
  *  Supports: ESWL01, ESWL03 (basic wall switches)
  *
+ *  Implemented but not yet verified on hardware.
+ *
  */
 
 import groovy.transform.Field

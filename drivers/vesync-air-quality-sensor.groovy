@@ -21,6 +21,8 @@
  *  Standalone air quality sensor for purifiers with AQ monitoring
  *  (Core300S, Core400S, Core600S, Vital100S, Vital200S, LAP-C/V/EL series)
  *
+ *  Verified on: Core400S-P. Other listed models are implemented but not yet verified.
+ *
  */
 
 import groovy.transform.Field

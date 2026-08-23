@@ -20,6 +20,8 @@
  *
  *  Supports: Core200S, Core300S, Core400S, Core600S, Vital100S, Vital200S, LAP-C/V/EL series, LV-PUR131S
  *
+ *  Verified on: Core200S-P, Core400S-P. Other listed models are implemented but not yet verified.
+ *
  */
 
 import groovy.transform.Field

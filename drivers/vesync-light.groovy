@@ -20,6 +20,8 @@
  *
  *  Supports: ESL100, ESL100CW, ESL100MC, XYD0001, ESWD16 (dimmer)
  *
+ *  Implemented but not yet verified on hardware.
+ *
  */
 
 import groovy.transform.Field

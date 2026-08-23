@@ -20,6 +20,8 @@
  *
  *  Supports: Classic200S, Classic300S, Dual200S, LV600S, OasisMist series, Superior6000S
  *
+ *  Verified on: Superior6000S (LEH-S601S). Other listed models are implemented but not yet verified.
+ *
  */
 
 import groovy.transform.Field

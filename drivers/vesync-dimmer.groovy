@@ -20,6 +20,8 @@
  *
  *  Supports: ESWD16 (dimmer switch with RGB indicator light)
  *
+ *  Implemented but not yet verified on hardware.
+ *
  */
 
 import groovy.transform.Field

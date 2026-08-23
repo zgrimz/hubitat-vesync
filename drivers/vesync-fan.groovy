@@ -20,6 +20,8 @@
  *
  *  Supports: LTF-F422S series tower fans
  *
+ *  Implemented but not yet verified on hardware.
+ *
  */
 
 import groovy.transform.Field

@@ -9,37 +9,36 @@ VeSync, Levoit, or Etekcity.
 
 ## Supported Devices
 
-### Air Purifiers
-- Core200S, Core300S, Core400S, Core600S
-- Vital100S, Vital200S
-- LAP-C201S, LAP-C202S, LAP-C301S, LAP-C302S, LAP-C401S, LAP-C601S
-- LAP-V201S, LAP-EL551S
-- LV-PUR131S, LV-RH131S
+### Verified
 
-### Humidifiers
-- Classic200S, Classic300S
-- Dual200S, LV600S
-- OasisMist, OasisMist600S, OasisMist1000S
-- Superior6000S
-- LUH and LEH series
+Hardware I own and actively run this integration against:
 
-### Smart Bulbs
-- ESL100 (Basic White)
-- ESL100CW (Tunable White)
-- ESL100MC (RGB Color)
-- XYD0001 (RGB Color)
+| Device | Model | Driver |
+|---|---|---|
+| Air Purifier | Core200S-P | `vesync-air-purifier.groovy` |
+| Air Purifier | Core400S-P | `vesync-air-purifier.groovy` |
+| Air Quality Sensor | (auto-created by Core400S-P) | `vesync-air-quality-sensor.groovy` |
+| Humidifier | Superior6000S (LEH-S601S) | `vesync-humidifier.groovy` |
 
-### Smart Outlets
-- ESO15-TB, ESW15-USA
-- ESW03-USA, ESW01-EU, ESW10-USA
-- wifi-switch-1.3
+### Implemented, not yet verified
 
-### Fans
-- LTF-F422S series (Tower Fans)
+Support for these is written and follows the same API patterns, but I don't own the hardware and
+haven't been able to test it. If you run one of these, I'd genuinely like to hear how it goes —
+open an issue with a debug log either way, working or not.
 
-### Wall Switches & Dimmers
-- ESWL01, ESWL03 (Basic Switches)
-- ESWD16 (Dimmer with RGB Indicator)
+**Air Purifiers** — Core300S, Core600S, Vital100S, Vital200S, LAP-C201S, LAP-C202S, LAP-C301S,
+LAP-C302S, LAP-C401S, LAP-C601S, LAP-V201S, LAP-EL551S, LV-PUR131S, LV-RH131S
+
+**Humidifiers** — Classic200S, Classic300S, Dual200S, LV600S, OasisMist, OasisMist600S,
+OasisMist1000S, and other LUH/LEH series models
+
+**Smart Bulbs** — ESL100 (white), ESL100CW (tunable white), ESL100MC (RGB), XYD0001 (RGB)
+
+**Smart Outlets** — ESO15-TB, ESW15-USA, ESW03-USA, ESW01-EU, ESW10-USA, wifi-switch-1.3
+
+**Tower Fans** — LTF-F422S series
+
+**Wall Switches & Dimmers** — ESWL01, ESWL03 (switches), ESWD16 (dimmer with RGB indicator)
 
 ## Installation
 
@@ -67,8 +66,9 @@ For each driver you need, repeat the following:
 - `drivers/vesync-fan.groovy` — For tower fans
 - `drivers/vesync-switch.groovy` — For basic wall switches
 - `drivers/vesync-dimmer.groovy` — For dimmer switches
-- `drivers/vesync-air-quality-sensor.groovy` — For air quality monitoring (auto-created for
-  compatible purifiers)
+- `drivers/vesync-air-quality-sensor.groovy` — Required alongside the purifier driver if you
+  have a Core300S/400S/600S, Vital, or LAP- series purifier. The app auto-creates an air quality
+  child device for those models, and discovery logs an error if this driver isn't installed.
 
 ### Step 3: Configure the App
 
@@ -110,7 +110,7 @@ Device states are automatically updated at a configurable interval (default: 2 m
 - Current humidity reading
 - Water level monitoring
 - Night light control
-- Drying mode (Superior6000S)
+- Drying mode (Superior6000S) — implemented, not yet verified
 
 #### Smart Bulbs
 - On/Off control
@@ -188,7 +188,8 @@ their full license texts.
 
 ### 1.0.0
 - Initial release
-- Support for air purifiers, humidifiers, bulbs, outlets, fans, and switches
+- Verified on Core200S-P, Core400S-P, and Superior6000S
+- Drivers for bulbs, outlets, tower fans, switches, and dimmers included but not yet verified
 - Automatic device discovery
 - JWT token management with auto-refresh
 - Configurable polling interval

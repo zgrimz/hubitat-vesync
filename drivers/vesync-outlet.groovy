@@ -21,6 +21,8 @@
  *  Supports: ESO15-TB, ESW15-USA, ESW03-USA, ESW01-EU, ESW10-USA, wifi-switch-1.3
  *  Features: Power monitoring (watts, voltage, energy)
  *
+ *  Implemented but not yet verified on hardware.
+ *
  */
 
 import groovy.transform.Field
