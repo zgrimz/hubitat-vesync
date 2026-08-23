@@ -197,6 +197,4 @@ their full license texts.
 
 ## License
 
-Copyright 2025-2026 Zachary Grimshaw
-
 Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
