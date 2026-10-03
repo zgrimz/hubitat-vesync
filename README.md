@@ -90,17 +90,30 @@ which devices to install.
 
 ### Automatic Polling
 Device states are automatically updated at a configurable interval (default: 2 minutes).
+Repeated refresh requests for the same device are combined, including refreshes after commands.
+Different devices retain their own scheduled refreshes. Status reads are spaced at least five
+seconds apart per device and back off from 15 seconds to five minutes after failures. HTTP
+requests time out after 15 seconds; a 30-second guard recovers if a status callback is lost.
+Commands are still submitted immediately. These scheduling guards use Hubitat's `singleThreaded`
+app option, available on platform 2.2.9 and later.
 
 ### Device Capabilities
 
 #### Air Purifiers
 - On/Off control
-- Fan speed control (1-4 levels)
+- Fan speed control, matched to your model's own level count (3 or 4 speeds)
+- Standard Hubitat `FanControl` speeds, so dashboard fan tiles, Alexa, and Google all work
 - Mode selection (Manual, Auto, Sleep, Pet, Turbo)
 - Air quality monitoring (PM2.5, PM10)
 - Filter life tracking
 - Child lock control
 - Display on/off
+
+#### Air Quality Sensors
+Auto-created alongside purifiers that have an air quality sensor.
+- PM2.5 and PM10 readings
+- Air quality index, level, and a plain-language description
+- Configurable alert threshold
 
 #### Humidifiers
 - On/Off control
@@ -109,7 +122,8 @@ Device states are automatically updated at a configurable interval (default: 2 m
 - Mode selection (Manual, Auto, Sleep)
 - Current humidity reading
 - Water level monitoring
-- Night light control
+- Night light control — implemented, not yet verified
+- Auto stop at target humidity — implemented, not yet verified
 - Drying mode (Superior6000S) — implemented, not yet verified
 
 #### Smart Bulbs
@@ -122,14 +136,17 @@ Device states are automatically updated at a configurable interval (default: 2 m
 - On/Off control
 - Power monitoring (watts)
 - Voltage monitoring
-- Energy tracking (kWh)
+- Energy tracking (kWh), with a resettable counter
+- Derived amperage and an "in use" indicator with a configurable threshold
+- Night light mode — implemented, not yet verified
 
 #### Fans
 - On/Off control
 - Speed control (1-12 levels)
+- Standard Hubitat `FanControl` speeds
 - Oscillation control
 - Mode selection (Normal, Auto, Sleep, Turbo)
-- Timer support
+- Timer support — implemented, not yet verified
 
 ### Exclusions
 You can exclude devices by:
@@ -152,6 +169,18 @@ You can exclude devices by:
 - Check the device's connection status in the VeSync app
 - Try clicking "Refresh" on the device page
 - Verify your hub has internet connectivity
+
+### After Updating the Code
+Save the app and affected driver code, then open the installed VeSync app and click **Done**
+to rebuild its schedules. Update the app and drivers together. Existing devices are retained.
+For troubleshooting hub slowdowns, temporarily disable the installed VeSync app and its devices
+and compare stability before re-enabling them; a code review alone cannot identify a hub crash.
+
+### Local Reliability Checks
+From this repository, run `groovy tests/reliability.groovy`. The tests execute the app and driver
+methods with mocked Hubitat scheduling, HTTP callbacks, and devices. They cover duplicate
+refreshes, lost/late callbacks, failure backoff, power state, and level-change limits. They do
+not replace a test on Hubitat hardware or verify the live VeSync API.
 
 ### Debug Logging
 Enable debug logging in the app or driver preferences to see detailed logs:
@@ -185,6 +214,37 @@ Neither project is affiliated with Hubitat or with this integration. See [NOTICE
 their full license texts.
 
 ## Version History
+
+### 1.1.1
+
+- Coalesce refreshes per device, reject late responses, recover lost callbacks, and bound
+  status-request frequency with explicit HTTP timeouts and failure backoff
+- Preserve reported purifier/fan power when an off device retains a speed setting
+- Bound light/dimmer ramps and stop them when brightness commands fail
+- Add local regression checks for scheduling, callbacks, power state, and ramp limits
+
+Update the parent app and any installed **Air Purifier**, **Fan**, **Light**, and **Dimmer**
+drivers to 1.1.1, then open the installed VeSync app and click **Done** to reset old schedules.
+Other drivers remain at 1.1.0 and do not need an update for this patch.
+
+### 1.1.0
+
+Reliability and accuracy work across the app and every driver.
+
+- Air quality sensors now report level, description, and last-update time alongside PM2.5
+- Outlets now report amperage and an "in use" state, and `resetEnergy` offsets the reading
+- Filter life, mist level, and display state now report their true value, including zero
+- Installing several devices at once refreshes all of them, not just the last
+- Commands that fail now resync the device state instead of leaving the UI optimistic
+- Purifiers and fans publish `supportedFanSpeeds` and use the standard `FanControl` ENUM,
+  so dashboard fan tiles, Alexa, and Google see the right speeds for the model
+- Fan speed names map to each model's real level count, so 3-speed purifiers reach every speed
+- Night light, auto stop, timer, night light mode, and dimmer indicator commands now send a
+  payload — all unverified, and an unsupported command is now logged explicitly
+- Requests carry the device's own region and the hub's time zone
+- Maximum speed comes from one model table shared by app and driver, with a user override
+- Polling staggers its requests rather than issuing them all at once
+- Level-change ramps step every 2s to stay clear of cloud rate limits
 
 ### 1.0.0
 - Initial release

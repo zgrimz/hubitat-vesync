@@ -26,7 +26,13 @@
 
 import groovy.transform.Field
 
-@Field static final String VERSION = "1.0.0"
+@Field static final String VERSION = "1.1.1"
+
+// Seconds between steps of a startLevelChange ramp. Each step is a cloud API call,
+// so a 1s ramp risks tripping VeSync rate limiting on a long press.
+@Field static final Integer LEVEL_CHANGE_INTERVAL = 2
+@Field static final Integer MAX_LEVEL_CHANGE_STEPS = 100
+@Field static final Long MAX_LEVEL_CHANGE_MS = 210000L
 
 metadata {
     definition(name: "VeSync Dimmer", namespace: "vesync", author: "VeSync Hubitat Integration") {
@@ -109,7 +115,10 @@ def setLevel(level, duration = null) {
     level = Math.max(min, level)
 
     logDebug "Setting level to ${level}%"
-    parent.childSetBrightness(device.deviceNetworkId, level)
+    if (parent.childSetBrightness(device.deviceNetworkId, level) == false) {
+        stopLevelChange()
+        return false
+    }
     sendEvent(name: "level", value: level, unit: "%")
 
     // Turn on if not prestaging
@@ -118,11 +127,17 @@ def setLevel(level, duration = null) {
             sendEvent(name: "switch", value: "on")
         }
     }
+    return true
 }
 
 // ChangeLevel Capability
 def startLevelChange(direction) {
     logDebug "Starting level change: ${direction}"
+    stopLevelChange()
+    if (!(direction in ["up", "down"])) return
+    state.levelChangeLevel = Math.max(1, Math.min(100, (device.currentValue("level") ?: 50).toInteger()))
+    state.levelChangeSteps = 0
+    state.levelChangeDeadline = now() + MAX_LEVEL_CHANGE_MS
     state.levelChangeDirection = direction
     state.levelChangeRunning = true
     doLevelChange()
@@ -136,9 +151,15 @@ def stopLevelChange() {
 
 def doLevelChange() {
     if (!state.levelChangeRunning) return
+    if (now() >= (state.levelChangeDeadline ?: 0L) ||
+        (state.levelChangeSteps ?: 0) >= MAX_LEVEL_CHANGE_STEPS) {
+        stopLevelChange()
+        return
+    }
 
-    def currentLevel = device.currentValue("level") ?: 50
-    def step = settings.levelChangeStep ?: 10
+    // Advance our own target so a stale cloud poll cannot restart or prolong the ramp.
+    def currentLevel = state.levelChangeLevel ?: 50
+    def step = Math.max(1, Math.min(25, (settings.levelChangeStep ?: 10).toInteger()))
     def min = settings.minLevel ?: 1
 
     if (state.levelChangeDirection == "up") {
@@ -147,22 +168,27 @@ def doLevelChange() {
         currentLevel = Math.max(min, currentLevel - step)
     }
 
-    setLevel(currentLevel)
+    state.levelChangeLevel = currentLevel
+    state.levelChangeSteps = (state.levelChangeSteps ?: 0) + 1
+    if (setLevel(currentLevel) == false || !state.levelChangeRunning) {
+        stopLevelChange()
+        return
+    }
 
     if ((state.levelChangeDirection == "up" && currentLevel < 100) ||
         (state.levelChangeDirection == "down" && currentLevel > min)) {
-        runIn(1, "doLevelChange")
+        runIn(LEVEL_CHANGE_INTERVAL, "doLevelChange")
     } else {
-        state.levelChangeRunning = false
+        stopLevelChange()
     }
 }
 
 // Indicator Light Control
-def setIndicatorLight(state) {
-    logDebug "Setting indicator light to ${state}"
-    def enabled = state == "on" || state == true
-    parent.sendDeviceCommand(device.deviceNetworkId, "setIndicatorLight", [state: enabled])
-    sendEvent(name: "indicatorLightStatus", value: state)
+def setIndicatorLight(value) {
+    logDebug "Setting indicator light to ${value}"
+    def enabled = value == "on" || value == true
+    parent.childSetIndicatorLight(device.deviceNetworkId, enabled)
+    sendEvent(name: "indicatorLightStatus", value: value)
 }
 
 def setIndicatorColor(red, green, blue) {
@@ -172,9 +198,7 @@ def setIndicatorColor(red, green, blue) {
 
     logDebug "Setting indicator color to RGB(${red}, ${green}, ${blue})"
 
-    parent.sendDeviceCommand(device.deviceNetworkId, "setIndicatorColor", [
-        red: red, green: green, blue: blue
-    ])
+    parent.childSetIndicatorColor(device.deviceNetworkId, red, green, blue)
 
     def rgbHex = String.format("#%02x%02x%02x", red, green, blue)
     sendEvent(name: "indicatorRGB", value: rgbHex)

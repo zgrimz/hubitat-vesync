@@ -27,7 +27,7 @@
 
 import groovy.transform.Field
 
-@Field static final String VERSION = "1.0.0"
+@Field static final String VERSION = "1.1.0"
 
 metadata {
     definition(name: "VeSync Outlet", namespace: "vesync", author: "VeSync Hubitat Integration") {
@@ -140,7 +140,7 @@ def resetEnergy() {
 // Night Light Control (some outlets have RGB night lights)
 def setNightLightMode(mode) {
     logDebug "Setting night light mode to ${mode}"
-    parent.sendDeviceCommand(device.deviceNetworkId, "setNightLightMode", [mode: mode])
+    parent.childSetNightLightMode(device.deviceNetworkId, mode)
     sendEvent(name: "nightLightMode", value: mode)
 }
 

@@ -25,8 +25,15 @@
  */
 
 import groovy.transform.Field
+import groovy.json.JsonOutput
 
-@Field static final String VERSION = "1.0.0"
+@Field static final String VERSION = "1.1.1"
+
+// FanControl ENUM values by device speed count, so supportedFanSpeeds matches the hardware
+@Field static final Map SPEED_NAMES = [
+    3: ["low", "medium", "high"],
+    4: ["low", "medium-low", "medium-high", "high"]
+]
 
 metadata {
     definition(name: "VeSync Air Purifier", namespace: "vesync", author: "VeSync Hubitat Integration") {
@@ -36,10 +43,11 @@ metadata {
         capability "Actuator"
         capability "Sensor"
 
-        // Custom attributes
+        // Custom attributes. Note: `speed` and `supportedFanSpeeds` come from FanControl -
+        // `speed` is an ENUM there, so the numeric level lives in speedLevel instead.
         attribute "mode", "string"
-        attribute "speed", "number"
         attribute "speedLevel", "number"
+        attribute "speedPercent", "number"
         attribute "filterLife", "number"
         attribute "airQuality", "string"
         attribute "airQualityIndex", "number"
@@ -49,20 +57,20 @@ metadata {
         attribute "display", "string"
         attribute "deviceStatus", "string"
 
-        // Commands
-        command "setSpeed", [[name: "Speed Level*", type: "NUMBER", description: "Fan speed level (1-4)"]]
+        // Commands. setSpeed and cycleSpeed are part of FanControl and are not redeclared.
+        command "setSpeedLevel", [[name: "Level*", type: "NUMBER", description: "Raw device speed level"]]
         command "setMode", [[name: "Mode*", type: "ENUM", constraints: ["manual", "auto", "sleep", "pet", "turbo"]]]
         command "speedUp"
         command "speedDown"
         command "setChildLock", [[name: "State*", type: "ENUM", constraints: ["on", "off"]]]
         command "setDisplay", [[name: "State*", type: "ENUM", constraints: ["on", "off"]]]
-        command "cycleSpeed"
     }
 
     preferences {
         input name: "logEnable", type: "bool", title: "Enable debug logging", defaultValue: false
         input name: "txtEnable", type: "bool", title: "Enable description text logging", defaultValue: true
-        input name: "maxSpeed", type: "number", title: "Maximum Speed Level", defaultValue: 4, range: "1..12"
+        input name: "maxSpeedOverride", type: "number", title: "Maximum Speed Level (override)",
+            range: "1..12", description: "Leave blank to use the level count detected for your model"
     }
 }
 
@@ -78,13 +86,7 @@ def updated() {
 
 def initialize() {
     if (logEnable) runIn(1800, "logsOff")
-
-    // Auto-detect max speed based on device type if not manually overridden
-    def detectedMax = getMaxSpeedForDevice()
-    if (detectedMax && (!settings.maxSpeed || settings.maxSpeed == 4)) {
-        device.updateSetting("maxSpeed", [value: detectedMax, type: "number"])
-        log.info "Auto-detected max speed: ${detectedMax} for device type: ${getDeviceType()}"
-    }
+    publishSupportedSpeeds()
 }
 
 // Get device type from stored data
@@ -92,41 +94,20 @@ def getDeviceType() {
     return device.getDataValue("deviceType") ?: ""
 }
 
-// Determine max speed based on device model
+// Max speed comes from the parent app's model table, stamped onto the device at creation.
+// An explicit user override wins; there is no sentinel value that silently overwrites it.
 def getMaxSpeedForDevice() {
-    def deviceType = getDeviceType().toUpperCase()
+    if (settings.maxSpeedOverride) return settings.maxSpeedOverride.toInteger()
+    def stamped = device.getDataValue("maxSpeed")
+    return stamped ? stamped.toInteger() : 4
+}
 
-    // Core 200S series - 3 speeds (low, medium, high)
-    if (deviceType.contains("CORE200S") || deviceType.contains("CORE200")) {
-        return 3
-    }
-    // Core 300S series - 3 speeds
-    if (deviceType.contains("CORE300S") || deviceType.contains("CORE300")) {
-        return 3
-    }
-    // Core 400S series - 4 speeds
-    if (deviceType.contains("CORE400S") || deviceType.contains("CORE400")) {
-        return 4
-    }
-    // Core 600S series - 4 speeds
-    if (deviceType.contains("CORE600S") || deviceType.contains("CORE600")) {
-        return 4
-    }
-    // LV-PUR131S - 3 speeds
-    if (deviceType.contains("LV-PUR131") || deviceType.contains("LV-RH131")) {
-        return 3
-    }
-    // Vital series - 4 speeds
-    if (deviceType.contains("VITAL")) {
-        return 4
-    }
-    // LAP series - default to 4
-    if (deviceType.contains("LAP-")) {
-        return 4
-    }
-
-    // Default - use manual setting or 4
-    return settings.maxSpeed ?: 4
+// FanControl consumers (dashboards, Alexa, Google) read supportedFanSpeeds to know which
+// ENUM values this device accepts.
+def publishSupportedSpeeds() {
+    def max = getMaxSpeedForDevice()
+    def names = (SPEED_NAMES[max] ?: SPEED_NAMES[4]) + ["on", "off", "auto"]
+    sendEvent(name: "supportedFanSpeeds", value: JsonOutput.toJson(names))
 }
 
 def logsOff() {
@@ -152,40 +133,23 @@ def setSpeed(speed) {
     def max = getMaxSpeedForDevice()
 
     if (speed instanceof String) {
-        // Handle standard fan speed names
-        switch(speed.toLowerCase()) {
-            case "off":
-                off()
-                return
-            case "on":
-            case "auto":
-                setMode("auto")
-                return
-            case "low":
-                setSpeedLevel(1)
-                return
-            case "medium-low":
-                // For 3-speed devices, medium-low = 2; for 4-speed, medium-low = 2
-                setSpeedLevel(2)
-                return
-            case "medium":
-                // For 3-speed devices, medium = 2; for 4-speed, medium = 2
-                setSpeedLevel(Math.round(max / 2))
-                return
-            case "medium-high":
-                // For 3-speed devices, medium-high = 2; for 4-speed, medium-high = 3
-                setSpeedLevel(Math.round(max * 0.75))
-                return
-            case "high":
-                setSpeedLevel(max)
-                return
+        def name = speed.toLowerCase()
+        if (name == "off") { off(); return }
+        if (name == "on" || name == "auto") { setMode("auto"); return }
+
+        // Map the ENUM name onto this model's actual level count rather than assuming 4
+        def level = levelForName(name, max)
+        if (level != null) {
+            setSpeedLevel(level)
+            return
         }
+        logDebug "Unrecognized speed name '${speed}'"
+        return
     }
 
     // Numeric speed (percentage)
-    def level = Math.round((speed / 100.0) * max)
-    level = Math.max(1, Math.min(max, level))
-    setSpeedLevel(level)
+    def level = Math.round((speed.toDouble() / 100.0) * max)
+    setSpeedLevel(Math.max(1, Math.min(max, level.toInteger())))
 }
 
 def setSpeedLevel(level) {
@@ -193,27 +157,45 @@ def setSpeedLevel(level) {
     level = Math.max(1, Math.min(max, level.toInteger()))
 
     logDebug "Setting speed level to ${level} (max: ${max})"
-    parent.childSetSpeed(device.deviceNetworkId, level)
-
-    sendEvent(name: "speedLevel", value: level)
-    sendEvent(name: "speed", value: Math.round((level / max) * 100))
-
-    // Update fan speed name based on device's actual speed levels
-    def speedName = getSpeedName(level, max)
-    sendEvent(name: "fanSpeed", value: speedName)
-
-    // Ensure device is on when setting speed
-    if (device.currentValue("switch") != "on") {
-        sendEvent(name: "switch", value: "on")
-    }
+    if (parent.childSetSpeed(device.deviceNetworkId, level) == false) return false
+    publishSpeed(level)
+    // A successful submission may optimistically turn on; polled speed must never do so.
+    sendEvent(name: "switch", value: "on")
 }
 
-def getSpeedName(level, max) {
-    def ratio = level / max
-    if (ratio <= 0.25) return "low"
-    if (ratio <= 0.5) return "medium-low"
-    if (ratio <= 0.75) return "medium-high"
-    return "high"
+// Single place that turns a raw device level into the attributes Hubitat expects. Called
+// both by setSpeedLevel and by the parent app after a poll, so a commanded update and a
+// polled one always leave the device in the same shape.
+def publishSpeed(level) {
+    def max = getMaxSpeedForDevice()
+    level = Math.max(0, Math.min(max, (level ?: 0).toInteger()))
+
+    sendEvent(name: "speedLevel", value: level)
+    sendEvent(name: "speedPercent", value: Math.round((level / max) * 100), unit: "%")
+    sendEvent(name: "speed", value: level > 0 ? nameForLevel(level, max) : "off")
+}
+
+// ENUM name <-> level, derived from the model's own level count so 3-speed devices can
+// actually reach every speed instead of collapsing three names onto level 2.
+def nameForLevel(level, max) {
+    def names = SPEED_NAMES[max] ?: SPEED_NAMES[4]
+    def idx = Math.min(names.size() - 1, Math.max(0, level.toInteger() - 1))
+    return names[idx]
+}
+
+def levelForName(name, max) {
+    def names = SPEED_NAMES[max] ?: SPEED_NAMES[4]
+    def idx = names.indexOf(name)
+    if (idx >= 0) return idx + 1
+    // Names this model doesn't expose (e.g. "medium" on a 4-speed) fall back proportionally
+    switch (name) {
+        case "low": return 1
+        case "medium-low": return Math.max(1, Math.round(max * 0.4))
+        case "medium": return Math.max(1, Math.round(max * 0.5))
+        case "medium-high": return Math.max(1, Math.round(max * 0.75))
+        case "high": return max
+    }
+    return null
 }
 
 def speedUp() {
@@ -254,17 +236,17 @@ def setMode(mode) {
 }
 
 // Child Lock
-def setChildLock(state) {
-    logDebug "Setting child lock to ${state}"
-    parent.childSetChildLock(device.deviceNetworkId, state)
-    sendEvent(name: "childLock", value: state)
+def setChildLock(value) {
+    logDebug "Setting child lock to ${value}"
+    parent.childSetChildLock(device.deviceNetworkId, value)
+    sendEvent(name: "childLock", value: value)
 }
 
 // Display Control
-def setDisplay(state) {
-    logDebug "Setting display to ${state}"
-    parent.childSetDisplay(device.deviceNetworkId, state)
-    sendEvent(name: "display", value: state)
+def setDisplay(value) {
+    logDebug "Setting display to ${value}"
+    parent.childSetDisplay(device.deviceNetworkId, value)
+    sendEvent(name: "display", value: value)
 }
 
 // Refresh

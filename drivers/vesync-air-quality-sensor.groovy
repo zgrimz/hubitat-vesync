@@ -27,7 +27,7 @@
 
 import groovy.transform.Field
 
-@Field static final String VERSION = "1.0.0"
+@Field static final String VERSION = "1.1.0"
 
 // Air Quality Index Thresholds (based on PM2.5)
 @Field static final Map AQ_LEVELS = [

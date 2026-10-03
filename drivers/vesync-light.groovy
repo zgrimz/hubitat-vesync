@@ -27,7 +27,13 @@
 import groovy.transform.Field
 import hubitat.helper.ColorUtils
 
-@Field static final String VERSION = "1.0.0"
+@Field static final String VERSION = "1.1.1"
+
+// Seconds between steps of a startLevelChange ramp. Each step is a cloud API call,
+// so a 1s ramp risks tripping VeSync rate limiting on a long press.
+@Field static final Integer LEVEL_CHANGE_INTERVAL = 2
+@Field static final Integer MAX_LEVEL_CHANGE_STEPS = 100
+@Field static final Long MAX_LEVEL_CHANGE_MS = 210000L
 
 // Color temperature range
 @Field static final Integer CT_MIN_KELVIN = 2700
@@ -109,7 +115,10 @@ def setLevel(level, duration = null) {
     }
 
     logDebug "Setting level to ${level}%"
-    parent.childSetBrightness(device.deviceNetworkId, level)
+    if (parent.childSetBrightness(device.deviceNetworkId, level) == false) {
+        stopLevelChange()
+        return false
+    }
     sendEvent(name: "level", value: level, unit: "%")
 
     // Turn on if not prestaging
@@ -118,11 +127,17 @@ def setLevel(level, duration = null) {
             sendEvent(name: "switch", value: "on")
         }
     }
+    return true
 }
 
 // ChangeLevel Capability
 def startLevelChange(direction) {
     logDebug "Starting level change: ${direction}"
+    stopLevelChange()
+    if (!(direction in ["up", "down"])) return
+    state.levelChangeLevel = Math.max(1, Math.min(100, (device.currentValue("level") ?: 50).toInteger()))
+    state.levelChangeSteps = 0
+    state.levelChangeDeadline = now() + MAX_LEVEL_CHANGE_MS
     state.levelChangeDirection = direction
     state.levelChangeRunning = true
     doLevelChange()
@@ -136,9 +151,15 @@ def stopLevelChange() {
 
 def doLevelChange() {
     if (!state.levelChangeRunning) return
+    if (now() >= (state.levelChangeDeadline ?: 0L) ||
+        (state.levelChangeSteps ?: 0) >= MAX_LEVEL_CHANGE_STEPS) {
+        stopLevelChange()
+        return
+    }
 
-    def currentLevel = device.currentValue("level") ?: 50
-    def step = settings.levelChangeStep ?: 10
+    // Advance our own target so a stale cloud poll cannot restart or prolong the ramp.
+    def currentLevel = state.levelChangeLevel ?: 50
+    def step = Math.max(1, Math.min(25, (settings.levelChangeStep ?: 10).toInteger()))
 
     if (state.levelChangeDirection == "up") {
         currentLevel = Math.min(100, currentLevel + step)
@@ -146,13 +167,18 @@ def doLevelChange() {
         currentLevel = Math.max(1, currentLevel - step)
     }
 
-    setLevel(currentLevel)
+    state.levelChangeLevel = currentLevel
+    state.levelChangeSteps = (state.levelChangeSteps ?: 0) + 1
+    if (setLevel(currentLevel) == false || !state.levelChangeRunning) {
+        stopLevelChange()
+        return
+    }
 
     if ((state.levelChangeDirection == "up" && currentLevel < 100) ||
         (state.levelChangeDirection == "down" && currentLevel > 1)) {
-        runIn(1, "doLevelChange")
+        runIn(LEVEL_CHANGE_INTERVAL, "doLevelChange")
     } else {
-        state.levelChangeRunning = false
+        stopLevelChange()
     }
 }
 

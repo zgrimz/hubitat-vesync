@@ -26,7 +26,7 @@
 
 import groovy.transform.Field
 
-@Field static final String VERSION = "1.0.0"
+@Field static final String VERSION = "1.1.0"
 
 metadata {
     definition(name: "VeSync Humidifier", namespace: "vesync", author: "VeSync Hubitat Integration") {
@@ -167,17 +167,17 @@ def setMode(mode) {
 }
 
 // Child Lock
-def setChildLock(state) {
-    logDebug "Setting child lock to ${state}"
-    parent.childSetChildLock(device.deviceNetworkId, state)
-    sendEvent(name: "childLock", value: state)
+def setChildLock(value) {
+    logDebug "Setting child lock to ${value}"
+    parent.childSetChildLock(device.deviceNetworkId, value)
+    sendEvent(name: "childLock", value: value)
 }
 
 // Display Control
-def setDisplay(state) {
-    logDebug "Setting display to ${state}"
-    parent.childSetDisplay(device.deviceNetworkId, state)
-    sendEvent(name: "display", value: state)
+def setDisplay(value) {
+    logDebug "Setting display to ${value}"
+    parent.childSetDisplay(device.deviceNetworkId, value)
+    sendEvent(name: "display", value: value)
 }
 
 // Night Light
@@ -186,25 +186,23 @@ def setNightLight(brightness) {
     logDebug "Setting night light brightness to ${brightness}"
 
     // Night light control varies by model - some use 0-100, some use levels
-    def params = [brightness: brightness]
-    parent.sendDeviceCommand(device.deviceNetworkId, "setNightLight", params)
+    parent.childSetNightLight(device.deviceNetworkId, brightness)
     sendEvent(name: "nightLightBrightness", value: brightness)
 }
 
 // Auto Stop
-def setAutoStop(state) {
-    logDebug "Setting auto stop to ${state}"
-    def enabled = state == "on" || state == true
-    parent.sendDeviceCommand(device.deviceNetworkId, "setAutoStop", [state: enabled])
-    sendEvent(name: "autoStop", value: state)
+def setAutoStop(value) {
+    logDebug "Setting auto stop to ${value}"
+    parent.childSetAutoStop(device.deviceNetworkId, value == "on" || value == true)
+    sendEvent(name: "autoStop", value: value)
 }
 
 // Drying Mode (Superior 6000S)
-def setDryingMode(state) {
-    logDebug "Setting drying mode to ${state}"
-    def enabled = state == "on" || state == true
+def setDryingMode(value) {
+    logDebug "Setting drying mode to ${value}"
+    def enabled = value == "on" || value == true
     parent.childSetDryingMode(device.deviceNetworkId, enabled)
-    sendEvent(name: "dryingMode", value: state)
+    sendEvent(name: "dryingMode", value: value)
 }
 
 // Refresh

@@ -28,12 +28,22 @@ import groovy.json.JsonOutput
 import groovy.transform.Field
 import java.security.MessageDigest
 
-@Field static final String VERSION = "1.0.0"
+@Field static final String VERSION = "1.1.1"
 @Field static final String NAMESPACE = "vesync"
+
+@Field static final Integer HTTP_TIMEOUT_SECONDS = 15
+@Field static final Long REFRESH_GUARD_MS = 30000L
+@Field static final Long MIN_REFRESH_INTERVAL_MS = 5000L
+@Field static final Long MAX_REFRESH_BACKOFF_MS = 300000L
 
 // API Endpoints
 @Field static final String API_BASE_URL_US = "https://smartapi.vesync.com"
 @Field static final String API_BASE_URL_EU = "https://smartapi.vesync.eu"
+
+// Client identification sent with every request
+@Field static final String APP_VERSION = "2.8.6"
+@Field static final String PHONE_BRAND = "SM N9005"
+@Field static final String PHONE_OS = "Android"
 
 // EU Country Codes
 @Field static final List<String> EU_COUNTRIES = ["AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR",
@@ -66,6 +76,94 @@ import java.security.MessageDigest
     "ESWL01": "switch", "ESWL03": "switch"
 ]
 
+// Per-category API configuration. Adding a device family means adding one entry here and
+// one update<Category>Device() method - the endpoints, methods and payload shape all live
+// in this table rather than being spread across parallel switch statements.
+@Field static final Map CATEGORY_CONFIG = [
+    "purifier": [
+        "driver":          "VeSync Air Purifier",
+        "bypassV2":        true,
+        "statusMethod":    "getPurifierStatus",
+        "statusEndpoint":  "/cloud/v2/deviceManaged/bypassV2",
+        "commandEndpoint": "/cloud/v2/deviceManaged/bypassV2",
+        "statusPayload":   ["type": "air", "id": 0]
+    ],
+    "humidifier": [
+        "driver":          "VeSync Humidifier",
+        "bypassV2":        true,
+        "statusMethod":    "getHumidifierStatus",
+        "statusEndpoint":  "/cloud/v2/deviceManaged/bypassV2",
+        "commandEndpoint": "/cloud/v2/deviceManaged/bypassV2",
+        "statusPayload":   [:]
+    ],
+    "fan": [
+        "driver":          "VeSync Fan",
+        "bypassV2":        true,
+        "statusMethod":    "getTowerFanStatus",
+        "statusEndpoint":  "/cloud/v2/deviceManaged/bypassV2",
+        "commandEndpoint": "/cloud/v2/deviceManaged/bypassV2",
+        "statusPayload":   [:]
+    ],
+    "bulb": [
+        "driver":          "VeSync Light",
+        "bypassV2":        false,
+        "statusMethod":    "getLightStatus",
+        "statusEndpoint":  "/SmartBulb/v1/device/devicedetail",
+        "commandEndpoint": "/SmartBulb/v1/device/devicestatus"
+    ],
+    "dimmer": [
+        // UNVERIFIED - no hardware. ESWD16 uses the SmartBulb endpoints here because that
+        // is what this integration has always sent. /dimmer/v1/device/... is the more
+        // likely correct path, but it is left alone rather than swapped on a guess.
+        "driver":          "VeSync Dimmer",
+        "bypassV2":        false,
+        "statusMethod":    "getLightStatus",
+        "statusEndpoint":  "/SmartBulb/v1/device/devicedetail",
+        "commandEndpoint": "/SmartBulb/v1/device/devicestatus"
+    ],
+    "outlet": [
+        "driver":          "VeSync Outlet",
+        "bypassV2":        false,
+        "statusMethod":    "getOutletStatus",
+        "statusEndpoint":  "/v1/device/getOutletStatus",
+        "commandEndpoint": "/10a/v1/device/devicestatus"
+    ],
+    "switch": [
+        "driver":          "VeSync Switch",
+        "bypassV2":        false,
+        "statusMethod":    "getSwitchStatus",
+        "statusEndpoint":  "/inwallswitch/v1/device/devicedetail",
+        "commandEndpoint": "/inwallswitch/v1/device/devicestatus"
+    ]
+]
+
+// Maximum fan / mist speed level by model prefix. Single source of truth: stamped onto each
+// child device at creation and read back by the driver, so the app and driver cannot drift.
+@Field static final Map MAX_SPEED_MAP = [
+    "Core200S": 3, "Core300S": 3, "Core400S": 4, "Core600S": 4,
+    "LV-PUR131S": 3, "LV-RH131S": 3,
+    "Vital100S": 4, "Vital200S": 4,
+    "LAP-C201S": 3, "LAP-C202S": 3, "LAP-C301S": 3, "LAP-C302S": 3,
+    "LAP-C401S": 4, "LAP-C601S": 4, "LAP-V201S": 4, "LAP-EL551S": 4,
+    "LTF-F422S": 12
+]
+
+@Field static final Integer DEFAULT_MAX_SPEED = 4
+
+// Models that name their API fields differently from the rest of the family. Looked up by
+// deviceType prefix; anything not listed gets the defaults in getQuirks().
+@Field static final Map DEVICE_QUIRKS = [
+    // Superior 6000S reports and accepts numeric power, uses workMode rather than mode,
+    // names its auto mode "autoPro", and takes camelCase targetHumidity.
+    "LEH-S601S": ["numericPower": true, "modeKey": "workMode",
+                  "autoMode": "autoPro", "targetHumidityKey": "targetHumidity"]
+]
+
+@Field static final Map DEFAULT_QUIRKS = [
+    "numericPower": false, "modeKey": "mode",
+    "autoMode": "auto", "targetHumidityKey": "target_humidity"
+]
+
 definition(
     name: "VeSync Integration",
     namespace: NAMESPACE,
@@ -76,6 +174,9 @@ definition(
     iconX2Url: "",
     iconX3Url: "",
     singleInstance: true,
+    // Serialize the short request/response handlers so per-device refresh guards cannot race.
+    // HTTP itself remains asynchronous. Requires Hubitat platform 2.2.9 or later.
+    singleThreaded: true,
     importUrl: ""
 )
 
@@ -94,12 +195,14 @@ def mainPage() {
 
         if (state.token) {
             def tokenValid = isTokenValid()
+            def expiry = atomicState.tokenExpiry
+            def expiryText = expiry ? new Date(expiry).format("yyyy-MM-dd HH:mm:ss") : "Unknown"
             section("Status") {
                 paragraph "Connected to VeSync as: ${settings.username}"
                 if (tokenValid) {
-                    paragraph "Token expires: ${state.tokenExpiry ? new Date(state.tokenExpiry).format("yyyy-MM-dd HH:mm:ss") : 'Unknown'}"
+                    paragraph "Token expires: ${expiryText}"
                 } else {
-                    paragraph "<b style='color:red'>TOKEN EXPIRED</b> - Token expired on: ${state.tokenExpiry ? new Date(state.tokenExpiry).format("yyyy-MM-dd HH:mm:ss") : 'Unknown'}. Click 'Re-authenticate' below."
+                    paragraph "<b style='color:red'>TOKEN EXPIRED</b> - Token expired on: ${expiryText}. Click 'Re-authenticate' below."
                 }
             }
             section("Devices") {
@@ -208,7 +311,7 @@ def advancedPage() {
         section("Exclusions") {
             input "excludedTypes", "enum", title: "Exclude Device Types", multiple: true,
                 options: ["purifier": "Air Purifiers", "humidifier": "Humidifiers", "bulb": "Bulbs",
-                         "outlet": "Outlets", "fan": "Fans", "switch": "Switches"]
+                         "dimmer": "Dimmers", "outlet": "Outlets", "fan": "Fans", "switch": "Switches"]
             input "excludedNames", "text", title: "Exclude Devices by Name (comma-separated)", required: false
         }
     }
@@ -240,9 +343,46 @@ def initialize() {
         authenticate()
     }
 
+    backfillDeviceData()
+    // updated() removed queued jobs; do not leave their persisted guards behind.
+    def deviceIds = getChildDevices().collect { it.deviceNetworkId }
+    atomicState.keySet().findAll { it.toString().startsWith("refreshControl_") }.each { key ->
+        if (!deviceIds.contains(key.toString().substring("refreshControl_".length()))) {
+            atomicState.remove(key)
+        }
+    }
+    deviceIds.each { cid ->
+        def control = getRefreshControl(cid)
+        control.queued = false
+        control.inFlight = null
+        control.followUp = false
+        control.sequence = (control.sequence ?: 0L) + 1L
+        saveRefreshControl(cid, control)
+    }
+
     if (isTokenValid()) {
         scheduleTokenRefresh()
         schedulePolling()
+    }
+}
+
+// Devices created by earlier versions have no maxSpeed data value. Without this, a 3-speed
+// Core200S would silently start reporting itself as 4-speed after an upgrade.
+def backfillDeviceData() {
+    getChildDevices().each { child ->
+        if (child.deviceNetworkId.endsWith("-AQ")) return
+
+        def deviceType = child.getDataValue("deviceType")
+        if (!deviceType) return
+
+        if (!child.getDataValue("maxSpeed")) {
+            child.updateDataValue("maxSpeed", getMaxSpeed(deviceType).toString())
+            logDebug "Backfilled maxSpeed for ${child.label}"
+        }
+
+        if (getDeviceCategory(deviceType) in ["purifier", "fan"]) {
+            child.publishSupportedSpeeds()
+        }
     }
 }
 
@@ -267,7 +407,6 @@ def appButtonHandler(btn) {
         case "reAuthenticate":
             state.token = null
             state.accountId = null
-            state.tokenExpiry = null
             atomicState.tokenExpiry = null
             atomicState.lastAuthAttempt = 0  // Reset cooldown to allow immediate auth
             authenticate()
@@ -297,27 +436,21 @@ def authenticate() {
     }
 
     def apiUrl = getApiUrl()
-    def hashedPassword = hashPassword(settings.password)
 
-    def body = [
+    def body = buildBaseBody([
         email: settings.username,
-        password: hashedPassword,
-        appVersion: "2.8.6",
-        phoneBrand: "SM N9005",
-        phoneOS: "Android",
-        acceptLanguage: "en",
-        timeZone: "America/New_York",
+        password: hashPassword(settings.password),
         method: "login",
         token: "",
         accountID: "",
         devToken: "",
-        userType: "1",
-        traceId: now().toString()
-    ]
+        userType: "1"
+    ])
 
     def params = [
         uri: "${apiUrl}/cloud/v1/user/login",
         contentType: "application/json",
+        timeout: HTTP_TIMEOUT_SECONDS,
         body: JsonOutput.toJson(body)
     ]
 
@@ -347,18 +480,17 @@ def handleAuthResponse(resp, data) {
         logDebug "Auth response code: ${jsonData?.code}"
 
         if (jsonData?.code == 0 && jsonData?.result) {
-            // Use atomicState for token expiry to ensure consistency across async callbacks
-            def newExpiry = now() + (30L * 24L * 60L * 60L * 1000L) // 30 days - use Long to avoid integer overflow
+            // atomicState writes through immediately, so the scheduling calls below can read
+            // the new expiry directly - no runIn() delay needed to "let state persist".
+            def newExpiry = now() + (30L * 24L * 60L * 60L * 1000L) // 30 days - Long avoids int overflow
             atomicState.tokenExpiry = newExpiry
-            state.tokenExpiry = newExpiry
             state.token = jsonData.result.token
             state.accountId = jsonData.result.accountID
             state.authMessage = "Authentication successful!"
             logInfo "Successfully authenticated with VeSync - new token expires: ${new Date(newExpiry)}"
 
-            // Schedule tasks with a short delay to ensure state is persisted
-            runIn(2, "scheduleTokenRefresh")
-            runIn(3, "schedulePollingDirect")
+            scheduleTokenRefresh()
+            schedulePolling()
         } else {
             state.authMessage = "Authentication failed: ${jsonData?.msg ?: 'Unknown error (code: ' + jsonData?.code + ')'}"
             logError "Authentication failed: ${jsonData?.msg ?: jsonData}"
@@ -367,6 +499,31 @@ def handleAuthResponse(resp, data) {
         state.authMessage = "Authentication failed: HTTP ${resp.status}"
         logError "Authentication failed: status=${resp.status}"
     }
+}
+
+// Every VeSync request carries the same client-identification envelope. Callers pass only
+// the fields that differ; `extra` wins on collision so authenticate() can blank the token.
+def buildBaseBody(Map extra = [:]) {
+    def body = [
+        acceptLanguage: "en",
+        appVersion: APP_VERSION,
+        phoneBrand: PHONE_BRAND,
+        phoneOS: PHONE_OS,
+        timeZone: location.timeZone?.ID ?: "America/New_York",
+        accountID: state.accountId,
+        token: state.token,
+        traceId: now().toString()
+    ]
+    return body + extra
+}
+
+// Returns the first non-null value among `keys`. Unlike ?:, a legitimate 0 or false does
+// not fall through to the next candidate - which is what made a 0% filter read as 100%.
+def pick(Map src, List keys, def fallback = null) {
+    for (k in keys) {
+        if (src?.get(k) != null) return src[k]
+    }
+    return fallback
 }
 
 def hashPassword(password) {
@@ -386,8 +543,8 @@ def isTokenValid() {
     if (!state.token) {
         return false
     }
-    // Prefer atomicState.tokenExpiry as it's more consistent across async callbacks
-    def expiry = atomicState.tokenExpiry ?: state.tokenExpiry
+    // atomicState is the only writer of tokenExpiry - it survives async callbacks intact
+    def expiry = atomicState.tokenExpiry
     if (!expiry) {
         // No expiry recorded, token is invalid
         return false
@@ -402,7 +559,8 @@ def isTokenValid() {
 
 def scheduleTokenRefresh() {
     // Refresh token 5 days before expiry - use Long to avoid integer overflow
-    def refreshTime = state.tokenExpiry ? state.tokenExpiry - (5L * 24L * 60L * 60L * 1000L) : now() + (25L * 24L * 60L * 60L * 1000L)
+    def expiry = atomicState.tokenExpiry
+    def refreshTime = expiry ? expiry - (5L * 24L * 60L * 60L * 1000L) : now() + (25L * 24L * 60L * 60L * 1000L)
     def delay = refreshTime - now()
 
     if (delay > 0) {
@@ -421,11 +579,6 @@ def schedulePolling() {
         return
     }
 
-    schedulePollingDirect()
-}
-
-// Called directly after auth success - skips token validity check since we just authenticated
-def schedulePollingDirect() {
     unschedule("refreshAllDevices")
 
     def intervalSeconds = (settings.pollingInterval ?: "120").toInteger()
@@ -451,23 +604,16 @@ def discoverDevices() {
 
     def apiUrl = getApiUrl()
 
-    def body = [
-        acceptLanguage: "en",
-        appVersion: "2.8.6",
-        phoneBrand: "SM N9005",
-        phoneOS: "Android",
-        timeZone: "America/New_York",
-        accountID: state.accountId,
-        token: state.token,
+    def body = buildBaseBody([
         method: "devices",
         pageNo: 1,
-        pageSize: 100,
-        traceId: now().toString()
-    ]
+        pageSize: 100
+    ])
 
     def params = [
         uri: "${apiUrl}/cloud/v1/deviceManaged/devices",
         contentType: "application/json",
+        timeout: HTTP_TIMEOUT_SECONDS,
         body: JsonOutput.toJson(body)
     ]
 
@@ -555,7 +701,7 @@ def getDeviceCategory(deviceType) {
     if (deviceType.contains("ESL") || deviceType.contains("XYD")) {
         return "bulb"
     }
-    if (deviceType.contains("ESO") || deviceType.contains("ESW") && !deviceType.contains("ESWL")) {
+    if (deviceType.contains("ESO") || (deviceType.contains("ESW") && !deviceType.contains("ESWL"))) {
         return "outlet"
     }
     if (deviceType.contains("LTF")) {
@@ -568,17 +714,29 @@ def getDeviceCategory(deviceType) {
     return "unknown"
 }
 
+// Single lookup for everything category-specific: driver name, endpoints, API method and
+// whether the request needs the bypassV2 payload wrapper.
+def getCategoryConfig(category) {
+    return CATEGORY_CONFIG[category]
+}
+
 def getDriverName(category) {
-    switch(category) {
-        case "purifier": return "VeSync Air Purifier"
-        case "humidifier": return "VeSync Humidifier"
-        case "bulb": return "VeSync Light"
-        case "dimmer": return "VeSync Dimmer"
-        case "outlet": return "VeSync Outlet"
-        case "fan": return "VeSync Fan"
-        case "switch": return "VeSync Switch"
-        default: return null
-    }
+    return CATEGORY_CONFIG[category]?.driver
+}
+
+// Maximum speed level for a model, by prefix match against MAX_SPEED_MAP.
+def getMaxSpeed(deviceType) {
+    if (!deviceType) return DEFAULT_MAX_SPEED
+    def match = MAX_SPEED_MAP.find { prefix, max -> deviceType.startsWith(prefix) }
+    return match ? match.value : DEFAULT_MAX_SPEED
+}
+
+// Field-naming differences for models that don't follow the family convention.
+def getQuirks(deviceType) {
+    if (!deviceType) return DEFAULT_QUIRKS
+    def upper = deviceType.toUpperCase()
+    def match = DEVICE_QUIRKS.find { model, quirks -> upper.contains(model) }
+    return match ? (DEFAULT_QUIRKS + match.value) : DEFAULT_QUIRKS
 }
 
 // Device Management
@@ -623,11 +781,17 @@ def createChildDevice(deviceInfo) {
         child.updateDataValue("configModule", deviceInfo.configModule ?: "")
         child.updateDataValue("deviceRegion", deviceInfo.deviceRegion ?: "")
         child.updateDataValue("subDeviceNo", deviceInfo.subDeviceNo?.toString() ?: "0")
+        child.updateDataValue("maxSpeed", getMaxSpeed(deviceInfo.deviceType).toString())
+
+        // installed() ran inside addChildDevice, before maxSpeed was stamped, so the fan-like
+        // drivers need a nudge to publish supportedFanSpeeds for the right level count.
+        if (category in ["purifier", "fan"]) {
+            child.publishSupportedSpeeds()
+        }
 
         logInfo "Created device: ${deviceInfo.deviceName} (${driverName})"
 
-        // Initial refresh
-        runIn(2, "refreshChildDevice", [data: [cid: deviceInfo.cid]])
+        scheduleDeviceRefresh(deviceInfo.cid, 2000L)
 
         // Check if purifier has air quality sensor - create separate device
         if (category == "purifier" && hasAirQualitySensor(deviceInfo.deviceType)) {
@@ -676,6 +840,7 @@ def createAirQualitySensorDevice(deviceInfo) {
 
 def removeAllDevices() {
     getChildDevices().each {
+        atomicState.remove("refreshControl_${it.deviceNetworkId}".toString())
         deleteChildDevice(it.deviceNetworkId)
     }
     logInfo "Removed all child devices"
@@ -691,32 +856,100 @@ def refreshAllDevices() {
         return
     }
 
-    getChildDevices().each { child ->
-        // Skip AQ sensor devices - they get updated with their parent
-        if (!child.deviceNetworkId.endsWith("-AQ")) {
-            refreshChildDevice([cid: child.deviceNetworkId])
-        }
+    // Skip AQ sensor devices - they get updated with their parent
+    def targets = getChildDevices().findAll { !it.deviceNetworkId.endsWith("-AQ") }
+
+    // Keep different devices independent, while coalescing repeat requests for each CID.
+    targets.eachWithIndex { child, idx ->
+        scheduleDeviceRefresh(child.deviceNetworkId, (idx + 1) * 400L)
     }
+
+    logDebug "Scheduled refresh for ${targets.size()} device(s)"
 }
 
+// Public entry point used by child drivers and any jobs from an older app version.
 def refreshChildDevice(data) {
-    def cid = data.cid
-    def child = getChildDevice(cid)
+    scheduleDeviceRefresh(data?.cid)
+}
 
-    if (!child) {
-        logDebug "Child device not found: ${cid}"
-        return
+def getRefreshControl(cid) {
+    return atomicState["refreshControl_${cid}".toString()] ?: [:]
+}
+
+def saveRefreshControl(cid, Map control) {
+    atomicState["refreshControl_${cid}".toString()] = control
+}
+
+def refreshBackoffMillis(failures) {
+    return Math.min(MAX_REFRESH_BACKOFF_MS, 15000L * (1L << Math.min(5, Math.max(0, failures - 1))))
+}
+
+def scheduleDeviceRefresh(cid, delayMs = 0L) {
+    if (!cid || !getChildDevice(cid)) return
+    def control = getRefreshControl(cid)
+    def timestamp = now()
+
+    // A scheduled job or callback can be lost during a reboot. Both guards expire.
+    if (control.queued && timestamp < (control.dueAt ?: 0L) + REFRESH_GUARD_MS) return
+    control.queued = false
+    if (control.inFlight != null) {
+        if (timestamp < (control.startedAt ?: 0L) + REFRESH_GUARD_MS) {
+            control.followUp = true
+            saveRefreshControl(cid, control)
+            return
+        }
+        control.inFlight = null
+        control.failures = Math.min(6, (control.failures ?: 0) + 1)
+        control.retryAfter = timestamp + refreshBackoffMillis(control.failures)
     }
 
-    def deviceType = child.getDataValue("deviceType")
-    def uuid = child.getDataValue("uuid")
-    def configModule = child.getDataValue("configModule")
+    def dueAt = Math.max(timestamp + Math.max(0L, delayMs as Long),
+                        Math.max(control.retryAfter ?: 0L,
+                                 (control.lastStartedAt ?: 0L) + MIN_REFRESH_INTERVAL_MS))
+    control.sequence = (control.sequence ?: 0L) + 1L
+    control.queued = true
+    control.dueAt = dueAt
+    control.followUp = false
+    saveRefreshControl(cid, control)
+    // overwrite:false is essential: a different CID must not cancel this device's job.
+    runInMillis(Math.max(1L, dueAt - timestamp), "performDeviceRefresh",
+        [overwrite: false, data: [cid: cid, sequence: control.sequence]])
+}
 
-    getDeviceDetails(cid, deviceType, uuid, configModule)
+def performDeviceRefresh(data) {
+    def cid = data?.cid
+    if (!cid) return
+    def control = getRefreshControl(cid)
+    if (!control.queued || control.sequence != data.sequence) return
+    control.queued = false
+    saveRefreshControl(cid, control)
+    def child = getChildDevice(cid)
+    if (!child) return
+    getDeviceDetails(child, data.sequence)
+}
+
+// One expiring watchdog per request releases a pending refresh even if its callback is lost.
+def expireDeviceRefresh(data) {
+    if (!data?.cid || getRefreshControl(data.cid).inFlight != data.sequence) return
+    completeDeviceRefresh(data.cid, data.sequence, false)
+}
+
+def completeDeviceRefresh(cid, sequence, success) {
+    def control = getRefreshControl(cid)
+    // Ignore callbacks from a request whose guard already expired and was replaced.
+    if (control.inFlight != sequence) return
+    control.inFlight = null
+    control.failures = success ? 0 : Math.min(6, (control.failures ?: 0) + 1)
+    control.retryAfter = success ? 0L : now() + refreshBackoffMillis(control.failures)
+    def followUp = control.followUp == true
+    control.followUp = false
+    saveRefreshControl(cid, control)
+    if (followUp) scheduleDeviceRefresh(cid)
 }
 
 // API Communication
-def getDeviceDetails(cid, deviceType, uuid, configModule) {
+def getDeviceDetails(child, sequence) {
+    def cid = child.deviceNetworkId
     logDebug "Getting details for device: ${cid}"
 
     if (!isTokenValid()) {
@@ -724,128 +957,81 @@ def getDeviceDetails(cid, deviceType, uuid, configModule) {
         return
     }
 
-    def apiUrl = getApiUrl()
+    def deviceType = child.getDataValue("deviceType")
     def category = getDeviceCategory(deviceType)
+    def cfg = getCategoryConfig(category)
 
-    // Determine API method based on device type
-    def apiMethod = getApiMethod(deviceType, category)
-    def apiEndpoint = getApiEndpoint(category, apiMethod)
+    if (!cfg) {
+        logError "No API configuration for category '${category}' (${deviceType})"
+        return
+    }
 
-    // For bypassV2 endpoints, the outer method is "bypassV2", the actual API method goes in payload
-    def outerMethod = (category in ["purifier", "humidifier", "fan"]) ? "bypassV2" : apiMethod
-
-    def body = [
-        acceptLanguage: "en",
-        appVersion: "2.8.6",
-        phoneBrand: "SM N9005",
-        phoneOS: "Android",
-        timeZone: "America/New_York",
-        accountID: state.accountId,
-        token: state.token,
-        uuid: uuid,
+    // For bypassV2 endpoints the outer method is "bypassV2" and the real API method moves
+    // into the payload; everything else sends the API method directly.
+    def body = buildBaseBody([
+        uuid: child.getDataValue("uuid"),
         cid: cid,
-        configModule: configModule ?: deviceType,
-        deviceRegion: "US",
-        method: outerMethod,
-        traceId: now().toString()
-    ]
+        configModule: child.getDataValue("configModule") ?: deviceType,
+        deviceRegion: child.getDataValue("deviceRegion") ?: "US",
+        method: cfg.bypassV2 ? "bypassV2" : cfg.statusMethod
+    ])
 
-    // For bypassV2 endpoints (purifier, humidifier, fan), add payload structure
-    if (category in ["purifier", "humidifier", "fan"]) {
-        // Purifiers need type: "air", id: 0 in the data payload
-        def payloadData = (category == "purifier") ? [type: "air", id: 0] : [:]
+    if (cfg.bypassV2) {
         body.payload = [
-            data: payloadData,
-            method: apiMethod,
+            data: cfg.statusPayload ?: [:],
+            method: cfg.statusMethod,
             source: "APP"
         ]
     }
 
     def params = [
-        uri: "${apiUrl}${apiEndpoint}",
+        uri: "${getApiUrl()}${cfg.statusEndpoint}",
         contentType: "application/json",
+        timeout: HTTP_TIMEOUT_SECONDS,
         body: JsonOutput.toJson(body)
     ]
 
-    logDebug "Device details request to: ${apiEndpoint} with method: ${apiMethod}"
+    logDebug "Device details request to: ${cfg.statusEndpoint} with method: ${cfg.statusMethod}"
 
-    def callbackData = [cid: cid, category: category]
-
+    def control = getRefreshControl(cid)
+    control.inFlight = sequence
+    control.startedAt = now()
+    control.lastStartedAt = control.startedAt
+    saveRefreshControl(cid, control)
     try {
-        asynchttpPost("handleDeviceDetailsResponse", params, callbackData)
+        asynchttpPost("handleDeviceDetailsResponse", params,
+            [cid: cid, category: category, sequence: sequence])
+        runInMillis(REFRESH_GUARD_MS, "expireDeviceRefresh",
+            [overwrite: false, data: [cid: cid, sequence: sequence]])
     } catch (e) {
         logError "Error getting device details: ${e.message}"
+        completeDeviceRefresh(cid, sequence, false)
     }
 }
 
 def handleDeviceDetailsResponse(resp, data) {
-    if (resp.status == 200) {
-        try {
+    if (!data?.cid || data.sequence == null) return
+    if (getRefreshControl(data.cid).inFlight != data.sequence) return
+    def success = false
+    try {
+        if (resp.status == 200) {
             def jsonData = new JsonSlurper().parseText(resp.data)
-            logDebug "Device details response for ${data.cid}: code=${jsonData?.code}, hasResult=${jsonData?.result != null}"
-            // Debug: log the full response structure
-            logDebug "Device details TOP LEVEL keys: ${jsonData?.keySet()}"
-            logDebug "Device details TOP LEVEL msg: ${jsonData?.msg}"
-            logDebug "Device details result keys: ${jsonData?.result?.keySet()}"
-            logDebug "Device details result.code: ${jsonData?.result?.code}, result.msg: ${jsonData?.result?.msg}"
-            logDebug "Device details result.result keys: ${jsonData?.result?.result?.keySet()}"
-            // Check for other common locations
-            logDebug "Device details result.data keys: ${jsonData?.result?.data?.keySet()}"
-            logDebug "Device details data keys: ${jsonData?.data?.keySet()}"
-            if (jsonData?.code == 0 && jsonData?.result) {
-                // For bypassV2 endpoints, data might be nested in result.result or result.data
+            logDebug "Device details for ${data.cid}: code=${jsonData?.code}, msg=${jsonData?.msg}"
+            def innerCode = jsonData?.result instanceof Map ? jsonData.result.code : null
+            if (jsonData?.code == 0 && jsonData?.result && (innerCode == null || innerCode == 0)) {
                 def deviceData = jsonData.result.result ?: jsonData.result.data ?: jsonData.result
-                logDebug "Device data keys being used: ${deviceData?.keySet()}"
                 updateChildDevice(data.cid, deviceData, data.category)
+                success = true
             } else {
                 logDebug "Failed to get device details for ${data.cid}: ${jsonData?.msg ?: 'code=' + jsonData?.code}"
             }
-        } catch (e) {
-            logDebug "Device details parse error for ${data.cid}: ${e.message}"
+        } else {
+            logDebug "Device details HTTP error for ${data.cid}: ${resp.status}"
         }
-    } else {
-        logDebug "Device details HTTP error for ${data.cid}: ${resp.status}"
-    }
-}
-
-def getApiMethod(deviceType, category) {
-    switch(category) {
-        case "purifier":
-            // All purifiers use getPurifierStatus with bypassV2 endpoint
-            return "getPurifierStatus"
-        case "humidifier":
-            return "getHumidifierStatus"
-        case "bulb":
-        case "dimmer":
-            return "getLightStatus"
-        case "outlet":
-            return "getOutletStatus"
-        case "fan":
-            return "getTowerFanStatus"
-        case "switch":
-            return "getSwitchStatus"
-        default:
-            return "devicestatus"
-    }
-}
-
-def getApiEndpoint(category, method) {
-    switch(category) {
-        case "purifier":
-            return "/cloud/v2/deviceManaged/bypassV2"
-        case "humidifier":
-            return "/cloud/v2/deviceManaged/bypassV2"
-        case "bulb":
-        case "dimmer":
-            return "/SmartBulb/v1/device/devicedetail"
-        case "outlet":
-            return "/v1/device/${method}"
-        case "fan":
-            return "/cloud/v2/deviceManaged/bypassV2"
-        case "switch":
-            return "/inwallswitch/v1/device/devicedetail"
-        default:
-            return "/cloud/v1/deviceManaged/deviceDetail"
+    } catch (e) {
+        logDebug "Device details parse error for ${data.cid}: ${e.message}"
+    } finally {
+        completeDeviceRefresh(data.cid, data.sequence, success)
     }
 }
 
@@ -879,121 +1065,114 @@ def updateChildDevice(cid, data, category) {
 def updatePurifierDevice(child, data) {
     def status = data.result ?: data
 
-    // Log raw status for debugging - log all keys and full data
-    logDebug "Purifier data keys: ${data?.keySet()}"
-    logDebug "Purifier status keys: ${status?.keySet()}"
-    logDebug "Purifier raw status: enabled=${status.enabled}, deviceStatus=${status.deviceStatus}, device_status=${status.device_status}, powerSwitch=${status.powerSwitch}, mode=${status.mode}, fan_level=${status.fan_level}, level=${status.level}, speed=${status.speed}"
-
     // Power state
-    def powerState = status.enabled != null ? status.enabled : (status.deviceStatus == "on")
+    def powerState = status.enabled != null ? toOnOff(status.enabled) == "on" : (status.deviceStatus == "on")
     child.sendEvent(name: "switch", value: powerState ? "on" : "off")
 
-    // Fan speed
-    def speed = status.level ?: status.fan_level ?: status.speed ?: 0
-    child.sendEvent(name: "speed", value: speed)
+    // Fan speed. The driver owns the level -> ENUM/percent translation so a polled update
+    // and a commanded one leave the same attributes in the same shape.
+    def level = pick(status, ["level", "fan_level", "speed"], 0)
+    child.publishSpeed(level)
 
     // Mode
-    def mode = status.mode ?: "manual"
+    def mode = pick(status, ["mode"], "manual")
     child.sendEvent(name: "mode", value: mode)
 
-    // Filter life
-    def filterLife = status.filter_life ?: status.filterLife ?: 100
-    child.sendEvent(name: "filterLife", value: filterLife, unit: "%")
-
-    // Air quality
-    if (status.air_quality != null || status.airQuality != null) {
-        def aq = status.air_quality ?: status.airQuality
-        child.sendEvent(name: "airQuality", value: aq)
-
-        // Update AQ sensor device if exists
-        def aqDevice = getChildDevice("${child.deviceNetworkId}-AQ")
-        if (aqDevice) {
-            aqDevice.sendEvent(name: "airQuality", value: aq)
-        }
+    // Filter life - pick() rather than ?: so a spent (0%) filter doesn't read as 100%
+    def filterLife = pick(status, ["filter_life", "filterLife"])
+    if (filterLife != null) {
+        child.sendEvent(name: "filterLife", value: filterLife, unit: "%")
     }
 
-    // PM2.5
-    if (status.air_quality_value != null || status.pm25 != null) {
-        def pm25 = status.air_quality_value ?: status.pm25 ?: 0
-        child.sendEvent(name: "pm25", value: pm25, unit: "μg/m³")
+    def aqDevice = getChildDevice("${child.deviceNetworkId}-AQ")
 
-        def aqDevice = getChildDevice("${child.deviceNetworkId}-AQ")
-        if (aqDevice) {
-            aqDevice.sendEvent(name: "pm25", value: pm25, unit: "μg/m³")
-            aqDevice.sendEvent(name: "airQualityIndex", value: calculateAQI(pm25))
-        }
+    // Air quality
+    def aq = pick(status, ["air_quality", "airQuality"])
+    if (aq != null) {
+        child.sendEvent(name: "airQuality", value: aq)
+        aqDevice?.sendEvent(name: "airQuality", value: aq)
+    }
+
+    // PM2.5 - hand the raw readings to the sensor driver, which owns AQI classification
+    def pm25 = pick(status, ["air_quality_value", "pm25"])
+    def pm10 = pick(status, ["pm10"])
+    if (pm25 != null) {
+        child.sendEvent(name: "pm25", value: pm25, unit: "μg/m³")
+        if (pm10 != null) child.sendEvent(name: "pm10", value: pm10, unit: "μg/m³")
+        aqDevice?.updateAirQuality(pm25, pm10)
     }
 
     // Child lock
-    if (status.child_lock != null || status.childLock != null) {
-        def childLock = status.child_lock ?: status.childLock
-        child.sendEvent(name: "childLock", value: childLock ? "on" : "off")
+    def childLock = pick(status, ["child_lock", "childLock"])
+    if (childLock != null) {
+        child.sendEvent(name: "childLock", value: toOnOff(childLock))
     }
 
-    // Display
-    if (status.display != null || status.screenStatus != null) {
-        def display = status.display ?: (status.screenStatus == 1)
-        child.sendEvent(name: "display", value: display ? "on" : "off")
+    // Display - screenStatus is the numeric form used by some models
+    def display = pick(status, ["display", "screenStatus"])
+    if (display != null) {
+        child.sendEvent(name: "display", value: toOnOff(display))
     }
 
-    logDebug "Updated purifier ${child.label}: power=${powerState}, speed=${speed}, mode=${mode}"
+    logDebug "Updated purifier ${child.label}: power=${powerState}, level=${level}, mode=${mode}"
+}
+
+// VeSync reports booleans as true/false, 0/1 or "on"/"off" depending on model and field.
+def toOnOff(value) {
+    if (value instanceof Boolean) return value ? "on" : "off"
+    if (value instanceof Number) return value.intValue() != 0 ? "on" : "off"
+    return value?.toString()?.toLowerCase() in ["on", "true", "1"] ? "on" : "off"
 }
 
 def updateHumidifierDevice(child, data) {
     def status = data.result ?: data
 
-    // Log raw status for debugging
-    logDebug "Humidifier raw status: device_status=${status.device_status}, deviceStatus=${status.deviceStatus}, powerSwitch=${status.powerSwitch}, enabled=${status.enabled}, mode=${status.mode}, mist_mode=${status.mist_mode}, workMode=${status.workMode}"
-
-    // Power state - Superior 6000S uses device_status field
-    def powerState = false
-    if (status.device_status != null) {
-        powerState = status.device_status == "on"
-    } else if (status.deviceStatus != null) {
-        powerState = status.deviceStatus == "on"
-    } else if (status.powerSwitch != null) {
-        powerState = status.powerSwitch == 1 || status.powerSwitch == true
-    } else if (status.enabled != null) {
-        powerState = status.enabled
-    }
+    // Power state - models disagree on both the field name and the encoding
+    def rawPower = pick(status, ["device_status", "deviceStatus", "powerSwitch", "enabled"])
+    def powerState = rawPower != null && toOnOff(rawPower) == "on"
     child.sendEvent(name: "switch", value: powerState ? "on" : "off")
 
     // Current humidity
-    def humidity = status.humidity ?: 0
+    def humidity = pick(status, ["humidity"], 0)
     child.sendEvent(name: "humidity", value: humidity, unit: "%")
 
     // Temperature (Superior 6000S and other models with temperature sensors)
-    def temperature = status.humidity_temperature ?: status.temperature ?: null
+    def temperature = pick(status, ["humidity_temperature", "temperature"])
     if (temperature != null) {
-        child.sendEvent(name: "temperature", value: temperature, unit: "°F")
-        logDebug "Humidifier temperature: ${temperature}°F"
+        def scale = location.temperatureScale ?: "F"
+        child.sendEvent(name: "temperature", value: temperature, unit: "°${scale}")
     }
 
-    // Target humidity - log all possible fields for debugging
-    logDebug "Humidifier target humidity fields: target_humidity=${status.target_humidity}, targetHumidity=${status.targetHumidity}, auto_target_humidity=${status.auto_target_humidity}, configuration=${status.configuration}"
-    def targetHumidity = status.target_humidity ?: status.targetHumidity ?: status.auto_target_humidity ?: status.configuration?.auto_target_humidity ?: 50
-    child.sendEvent(name: "targetHumidity", value: targetHumidity, unit: "%")
+    def targetHumidity = pick(status, ["target_humidity", "targetHumidity", "auto_target_humidity"])
+    if (targetHumidity == null) {
+        targetHumidity = status.configuration?.auto_target_humidity
+    }
+    if (targetHumidity != null) {
+        child.sendEvent(name: "targetHumidity", value: targetHumidity, unit: "%")
+    }
 
-    // Mist level / virtual level (1-9 for Superior 6000S)
-    def mistLevel = status.mist_virtual_level ?: status.mist_level ?: status.mistLevel ?: status.level ?: 0
+    // Mist level / virtual level (1-9 for Superior 6000S). pick() so level 0 stays 0.
+    def mistLevel = pick(status, ["mist_virtual_level", "mist_level", "mistLevel", "level"], 0)
     child.sendEvent(name: "mistLevel", value: mistLevel)
 
-    // Mode - Superior 6000S uses mist_mode field
-    def mode = status.mist_mode ?: status.mode ?: status.workMode ?: "manual"
+    // Mode - Superior 6000S uses mist_mode / workMode
+    def mode = pick(status, ["mist_mode", "mode", "workMode"], "manual")
     child.sendEvent(name: "mode", value: mode)
 
     // Water level / tank status
-    def waterLack = status.water_lacks ?: status.waterLack ?: status.water_tank_lifted ?: false
-    child.sendEvent(name: "waterLevel", value: waterLack ? "low" : "ok")
+    def waterLack = pick(status, ["water_lacks", "waterLack", "water_tank_lifted"], false)
+    child.sendEvent(name: "waterLevel", value: toOnOff(waterLack) == "on" ? "low" : "ok")
 
     // Night light
-    if (status.night_light_brightness != null) {
-        child.sendEvent(name: "nightLightBrightness", value: status.night_light_brightness)
+    def nightLight = pick(status, ["night_light_brightness"])
+    if (nightLight != null) {
+        child.sendEvent(name: "nightLightBrightness", value: nightLight)
     }
 
     // Drying mode (Superior 6000S specific)
-    if (status.drying_mode_state != null) {
-        child.sendEvent(name: "dryingMode", value: status.drying_mode_state)
+    def drying = pick(status, ["drying_mode_state"])
+    if (drying != null) {
+        child.sendEvent(name: "dryingMode", value: toOnOff(drying))
     }
 
     logDebug "Updated humidifier ${child.label}: power=${powerState}, humidity=${humidity}%, target=${targetHumidity}%, mode=${mode}"
@@ -1037,18 +1216,11 @@ def updateOutletDevice(child, data) {
     def powerState = status.deviceStatus == "on"
     child.sendEvent(name: "switch", value: powerState ? "on" : "off")
 
-    // Power monitoring
-    if (status.power != null) {
-        child.sendEvent(name: "power", value: status.power, unit: "W")
-    }
-
-    if (status.voltage != null) {
-        child.sendEvent(name: "voltage", value: status.voltage, unit: "V")
-    }
-
-    if (status.energy != null) {
-        child.sendEvent(name: "energy", value: status.energy, unit: "kWh")
-    }
+    // The driver owns power-metric handling: it derives amperage and outletInUse and
+    // applies the resetEnergy offset, none of which happens if we sendEvent directly.
+    child.updatePowerMetrics(pick(status, ["power"]),
+                             pick(status, ["voltage"]),
+                             pick(status, ["energy"]))
 
     logDebug "Updated outlet ${child.label}: power=${powerState}, watts=${status.power}"
 }
@@ -1057,25 +1229,22 @@ def updateFanDevice(child, data) {
     def status = data.result ?: data
 
     // Power state
-    def powerState = status.enabled != null ? status.enabled : (status.deviceStatus == "on")
+    def powerState = status.enabled != null ? toOnOff(status.enabled) == "on" : (status.deviceStatus == "on")
     child.sendEvent(name: "switch", value: powerState ? "on" : "off")
 
-    // Speed
-    def speed = status.level ?: status.fan_level ?: 0
-    def maxSpeed = getMaxFanSpeed(child.getDataValue("deviceType"))
-    def speedPercent = Math.round((speed / maxSpeed) * 100)
-    child.sendEvent(name: "speed", value: speedPercent, unit: "%")
-    child.sendEvent(name: "speedLevel", value: speed)
+    // Speed - driver translates the raw level into the FanControl ENUM and percentage
+    def level = pick(status, ["level", "fan_level"], 0)
+    child.publishSpeed(level)
 
     // Mode
-    def mode = status.mode ?: "normal"
+    def mode = pick(status, ["mode"], "normal")
     child.sendEvent(name: "mode", value: mode)
 
     // Oscillation
-    def oscillation = status.oscillation_state ?: status.oscillationState ?: false
-    child.sendEvent(name: "oscillation", value: oscillation ? "on" : "off")
+    def oscillation = pick(status, ["oscillation_state", "oscillationState"], false)
+    child.sendEvent(name: "oscillation", value: toOnOff(oscillation))
 
-    logDebug "Updated fan ${child.label}: power=${powerState}, speed=${speed}"
+    logDebug "Updated fan ${child.label}: power=${powerState}, level=${level}, mode=${mode}"
 }
 
 def updateSwitchDevice(child, data) {
@@ -1086,23 +1255,6 @@ def updateSwitchDevice(child, data) {
     child.sendEvent(name: "switch", value: powerState ? "on" : "off")
 
     logDebug "Updated switch ${child.label}: power=${powerState}"
-}
-
-def getMaxFanSpeed(deviceType) {
-    if (deviceType?.startsWith("LTF-F422S")) return 12
-    if (deviceType?.startsWith("Core200S")) return 3
-    if (deviceType?.startsWith("Core300S")) return 3
-    if (deviceType?.startsWith("Core400S")) return 4
-    if (deviceType?.startsWith("Core600S")) return 4
-    return 4
-}
-
-def calculateAQI(pm25) {
-    if (pm25 <= 12) return 1  // Excellent
-    if (pm25 <= 35) return 2  // Good
-    if (pm25 <= 55) return 3  // Fair
-    if (pm25 <= 150) return 4 // Poor
-    return 5                   // Very Poor
 }
 
 // Device Control Methods (called by child devices)
@@ -1161,6 +1313,30 @@ def childSetDryingMode(cid, enabled) {
     sendDeviceCommand(cid, "setDryingMode", [enabled: enabled])
 }
 
+def childSetNightLight(cid, brightness) {
+    sendDeviceCommand(cid, "setNightLight", [brightness: brightness])
+}
+
+def childSetNightLightMode(cid, mode) {
+    sendDeviceCommand(cid, "setNightLightMode", [mode: mode])
+}
+
+def childSetAutoStop(cid, enabled) {
+    sendDeviceCommand(cid, "setAutoStop", [enabled: enabled])
+}
+
+def childSetTimer(cid, hours) {
+    sendDeviceCommand(cid, "setTimer", [hours: hours])
+}
+
+def childSetIndicatorLight(cid, enabled) {
+    sendDeviceCommand(cid, "setIndicatorLight", [enabled: enabled])
+}
+
+def childSetIndicatorColor(cid, red, green, blue) {
+    sendDeviceCommand(cid, "setIndicatorColor", [red: red, green: green, blue: blue])
+}
+
 def sendDeviceCommand(cid, command, cmdParams) {
     if (!isTokenValid()) {
         logError "Cannot send command - token expired or not authenticated"
@@ -1175,32 +1351,35 @@ def sendDeviceCommand(cid, command, cmdParams) {
     }
 
     def deviceType = child.getDataValue("deviceType")
-    def uuid = child.getDataValue("uuid")
-    def configModule = child.getDataValue("configModule")
     def category = getDeviceCategory(deviceType)
+    def cfg = getCategoryConfig(category)
 
-    def apiUrl = getApiUrl()
-    def endpoint = getCommandEndpoint(category)
+    if (!cfg) {
+        logError "No API configuration for category '${category}' (${deviceType})"
+        return false
+    }
+
+    // Refuse to send rather than POSTing method:"" - an unmapped command used to fail
+    // silently, which is how six driver commands shipped broken.
     def commandPayload = buildCommandPayload(command, cmdParams, deviceType, category)
+    if (!commandPayload?.method) {
+        logError "Command '${command}' is not supported for ${child.label} (${deviceType}, category ${category}) - nothing sent"
+        return false
+    }
 
-    def body = [
-        acceptLanguage: "en",
-        appVersion: "2.8.6",
-        phoneBrand: "SM N9005",
-        phoneOS: "Android",
-        timeZone: "America/New_York",
-        accountID: state.accountId,
-        token: state.token,
-        uuid: uuid,
+    def body = buildBaseBody([
+        uuid: child.getDataValue("uuid"),
         cid: cid,
-        configModule: configModule ?: deviceType,
-        deviceRegion: "US",
-        method: commandPayload.method,
-        traceId: now().toString()
-    ]
+        configModule: child.getDataValue("configModule") ?: deviceType,
+        deviceRegion: child.getDataValue("deviceRegion") ?: "US",
+        // Commands send the inner method name at the outer level, unlike status reads which
+        // send "bypassV2" there. The asymmetry looks wrong but is what the verified
+        // hardware accepts today, so it is preserved deliberately.
+        method: commandPayload.method
+    ])
 
     // For bypassV2 endpoints, wrap payload properly
-    if (category in ["purifier", "humidifier", "fan"]) {
+    if (cfg.bypassV2) {
         body.payload = [
             data: commandPayload.data,
             method: commandPayload.method,
@@ -1211,14 +1390,15 @@ def sendDeviceCommand(cid, command, cmdParams) {
     }
 
     def httpParams = [
-        uri: "${apiUrl}${endpoint}",
+        uri: "${getApiUrl()}${commandPayload.endpoint ?: cfg.commandEndpoint}",
         contentType: "application/json",
+        timeout: HTTP_TIMEOUT_SECONDS,
         body: JsonOutput.toJson(body)
     ]
 
     logDebug "Sending command ${command} to ${child.label}: method=${commandPayload.method}, data=${commandPayload.data}"
 
-    def callbackData = [cid: cid, command: command, childLabel: child.label]
+    def callbackData = [cid: cid, command: command, childLabel: child.label, category: category]
 
     try {
         asynchttpPost("handleCommandResponse", httpParams, callbackData)
@@ -1230,80 +1410,61 @@ def sendDeviceCommand(cid, command, cmdParams) {
 }
 
 def handleCommandResponse(resp, data) {
-    if (resp.status == 200) {
+    def failure = null
+
+    if (resp.status != 200) {
+        failure = "HTTP ${resp.status}"
+    } else {
         try {
             def jsonData = new JsonSlurper().parseText(resp.data)
-            if (jsonData?.code == 0) {
+            def innerCode = jsonData?.result instanceof Map ? jsonData.result.code : null
+            if (jsonData?.code == 0 && (innerCode == null || innerCode == 0)) {
                 logInfo "Command ${data.command} sent to ${data.childLabel}"
-                // Refresh device state after command
-                runIn(2, "refreshChildDevice", [data: [cid: data.cid]])
             } else {
-                logError "Command ${data.command} failed: ${jsonData?.msg ?: 'code=' + jsonData?.code}"
+                failure = (jsonData?.result instanceof Map ? jsonData.result.msg : null) ?:
+                    jsonData?.msg ?: "code=${innerCode != null ? innerCode : jsonData?.code}"
             }
         } catch (e) {
-            logError "Command response parse error: ${e.message}"
+            failure = "response parse error: ${e.message}"
         }
-    } else {
-        logError "Command ${data.command} failed: HTTP ${resp.status}"
     }
+
+    if (failure) {
+        logError "Command ${data.command} failed for ${data.childLabel}: ${failure}"
+        if (data.command == "setBrightness" && data.category in ["bulb", "dimmer"]) {
+            getChildDevice(data.cid)?.stopLevelChange()
+        }
+    }
+
+    // Resync either way. Drivers update their attributes optimistically, so on failure this
+    // is what pulls the UI back to reality instead of leaving it wrong until the next poll.
+    scheduleDeviceRefresh(data.cid, failure ? 1000L : 2000L)
 }
 
-def getCommandEndpoint(category) {
-    switch(category) {
-        case "purifier":
-        case "humidifier":
-        case "fan":
-            return "/cloud/v2/deviceManaged/bypassV2"
-        case "bulb":
-        case "dimmer":
-            return "/SmartBulb/v1/device/devicestatus"
-        case "outlet":
-            return "/10a/v1/device/devicestatus"
-        case "switch":
-            return "/inwallswitch/v1/device/devicestatus"
-        default:
-            return "/cloud/v1/deviceManaged/bypass"
-    }
-}
-
+// Returns [method:, data:, endpoint:(optional override)] or null when the command is not
+// supported for this device. Callers must treat null as "do not send".
 def buildCommandPayload(command, params, deviceType, category) {
     def method = ""
     def data = [:]
+    def endpoint = null
 
-    // Check if this is a Superior 6000S (LEH-S601S) which uses powerSwitch: 0/1 instead of enabled: true/false
-    def deviceTypeUpper = deviceType?.toUpperCase() ?: ""
-    def isSuperior6000S = deviceTypeUpper.contains("LEH-S601S")
+    // Field-naming differences (Superior 6000S and friends) come from the quirks table
+    // rather than an isXxx boolean threaded through every branch.
+    def q = getQuirks(deviceType)
+    def bypass = category in ["purifier", "humidifier", "fan"]
 
-    logDebug "buildCommandPayload: command=${command}, deviceType=${deviceType}, category=${category}, isSuperior6000S=${isSuperior6000S}"
+    logDebug "buildCommandPayload: command=${command}, deviceType=${deviceType}, category=${category}"
 
     switch(command) {
         case "turnOn":
-            if (category == "purifier" || category == "humidifier" || category == "fan") {
-                method = "setSwitch"
-                if (isSuperior6000S) {
-                    // Superior 6000S uses powerSwitch: 0/1
-                    data = [powerSwitch: 1, id: 0]
-                } else {
-                    data = [enabled: true, id: 0]
-                }
-            } else {
-                method = "devicestatus"
-                data = [status: "on"]
-            }
-            break
-
         case "turnOff":
-            if (category == "purifier" || category == "humidifier" || category == "fan") {
+            def on = (command == "turnOn")
+            if (bypass) {
                 method = "setSwitch"
-                if (isSuperior6000S) {
-                    // Superior 6000S uses powerSwitch: 0/1
-                    data = [powerSwitch: 0, id: 0]
-                } else {
-                    data = [enabled: false, id: 0]
-                }
+                data = q.numericPower ? [powerSwitch: on ? 1 : 0, id: 0] : [enabled: on, id: 0]
             } else {
                 method = "devicestatus"
-                data = [status: "off"]
+                data = [status: on ? "on" : "off"]
             }
             break
 
@@ -1313,48 +1474,20 @@ def buildCommandPayload(command, params, deviceType, category) {
             break
 
         case "setMode":
-            if (category == "humidifier") {
-                // Superior 6000S uses setHumidityMode with workMode parameter
-                method = "setHumidityMode"
-                if (isSuperior6000S) {
-                    // Superior 6000S uses workMode field and "autoPro" instead of "auto"
-                    def modeValue = (params.mode == "auto") ? "autoPro" : params.mode
-                    data = [workMode: modeValue, id: 0]
-                } else {
-                    data = [mode: params.mode, id: 0]
-                }
-            } else {
-                method = "setPurifierMode"
-                data = [mode: params.mode]
-            }
-            break
-
         case "setAutoMode":
-            if (category == "humidifier") {
-                method = "setHumidityMode"
-                if (isSuperior6000S) {
-                    // Superior 6000S uses "autoPro" instead of "auto"
-                    data = [workMode: "autoPro", id: 0]
-                } else {
-                    data = [mode: "auto", id: 0]
-                }
-            } else {
-                method = "setPurifierMode"
-                data = [mode: "auto"]
-            }
-            break
-
         case "setManualMode":
+            def mode = params?.mode
+            if (command == "setAutoMode") mode = "auto"
+            if (command == "setManualMode") mode = "manual"
+
             if (category == "humidifier") {
                 method = "setHumidityMode"
-                if (isSuperior6000S) {
-                    data = [workMode: "manual", id: 0]
-                } else {
-                    data = [mode: "manual", id: 0]
-                }
+                // Some models name auto differently (Superior 6000S: "autoPro")
+                def value = (mode == "auto") ? q.autoMode : mode
+                data = [(q.modeKey): value, id: 0]
             } else {
                 method = "setPurifierMode"
-                data = [mode: "manual"]
+                data = [mode: mode]
             }
             break
 
@@ -1387,12 +1520,7 @@ def buildCommandPayload(command, params, deviceType, category) {
 
         case "setTargetHumidity":
             method = "setTargetHumidity"
-            if (isSuperior6000S) {
-                // Superior 6000S uses targetHumidity (camelCase) based on status response
-                data = [targetHumidity: params.humidity, id: 0]
-            } else {
-                data = [target_humidity: params.humidity, id: 0]
-            }
+            data = [(q.targetHumidityKey): params.humidity, id: 0]
             break
 
         case "setMistLevel":
@@ -1402,21 +1530,80 @@ def buildCommandPayload(command, params, deviceType, category) {
 
         case "setOscillation":
             method = "setOscillationSwitch"
-            data = [enabled: params.state == "on" || params.state == true]
+            data = [enabled: asBool(pick(params, ["enabled", "state"]))]
             break
 
         case "setChildLock":
             method = "setChildLock"
-            data = [child_lock: params.state == "on" || params.state == true]
+            data = [child_lock: asBool(pick(params, ["enabled", "state"]))]
             break
 
         case "setDisplay":
             method = "setDisplay"
-            data = [state: params.state == "on" || params.state == true]
+            data = [state: asBool(pick(params, ["enabled", "state"]))]
             break
+
+        // ---------------------------------------------------------------------------
+        // The following commands were exposed by drivers but had no payload here, so
+        // they silently POSTed method:"" and did nothing. Payload shapes below follow
+        // the conventions of the surrounding bypassV2 / v1 calls.
+        //
+        // UNVERIFIED - no hardware. None of these run on a verified model (Core200S-P,
+        // Core400S-P, Superior6000S). Confirm against pyvesync/tsvesync before relying
+        // on them; sendDeviceCommand now logs an explicit error if a device rejects one.
+        // ---------------------------------------------------------------------------
+
+        case "setNightLight":
+            // UNVERIFIED - humidifiers with a night light (Classic/Dual/LV600S/OasisMist)
+            method = "setNightLightBrightness"
+            data = [night_light_brightness: params.brightness, id: 0]
+            break
+
+        case "setAutoStop":
+            // UNVERIFIED - humidifiers that stop at target humidity
+            method = "setAutomaticStop"
+            data = [enabled: asBool(pick(params, ["enabled", "state"])), id: 0]
+            break
+
+        case "setTimer":
+            // UNVERIFIED - tower fans (LTF-F422S). Hours converted to seconds.
+            method = "setTimer"
+            data = [total: (params.hours ?: 0) * 3600, action: "off", id: 0]
+            break
+
+        case "setNightLightMode":
+            // UNVERIFIED - outlets with an RGB night light (ESO15-TB, ESW15-USA)
+            method = "outletNightLightCtl"
+            data = [mode: params.mode]
+            break
+
+        case "setIndicatorLight":
+            // UNVERIFIED - ESWD16 dimmer. Uses its own endpoint, not the SmartBulb one.
+            method = "indicatorLightStatus"
+            endpoint = "/dimmer/v1/device/indicatorlightstatus"
+            data = [status: asBool(pick(params, ["enabled", "state"])) ? "on" : "off"]
+            break
+
+        case "setIndicatorColor":
+            // UNVERIFIED - ESWD16 dimmer RGB indicator ring
+            method = "devicergbstatus"
+            endpoint = "/dimmer/v1/device/devicergbstatus"
+            data = [status: "on", rgbValue: [red: params.red, green: params.green, blue: params.blue]]
+            break
+
+        default:
+            logDebug "buildCommandPayload: no mapping for command '${command}'"
+            return null
     }
 
-    return [method: method, data: data]
+    return [method: method, data: data, endpoint: endpoint]
+}
+
+// Driver commands arrive as "on"/"off" strings or booleans depending on the call site.
+def asBool(value) {
+    if (value instanceof Boolean) return value
+    if (value instanceof Number) return value.intValue() != 0
+    return value?.toString()?.toLowerCase() in ["on", "true", "1"]
 }
 
 // Logging
